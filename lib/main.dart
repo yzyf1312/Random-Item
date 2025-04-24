@@ -1,54 +1,66 @@
-import 'package:flutter/material.dart';
-import 'dart:math';
-import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
 import 'package:dynamic_color/dynamic_color.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:path/path.dart' as path;
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
+import 'package:random_item/date_fliter.dart';
 
 // 全局变量
 // 用于存储从JSON加载的数据
-Map? itemListData;
+Map<String, dynamic>? itemListData;
+bool isItemListDataEmpty = true;
 String? titleData;
 String? descriptionData;
 String? tipsData;
+
 // 用于存储从JSON加载的配置
 double? itemFontSize;
 String? themeState;
 int? randomInterval;
+List filters = [];
 
 bool isTimerRunning = false;
+final Set<String> historyItemSet = {};
+final Set<String> toRandomItemKeySet = {};
 
 void main() {
-  runApp(const MyApp());
+  runApp(const MyApp(brandColorp: Color(0xff6750a4)));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final Color brandColorp;
 
-// 这个组件是你的应用程序的根。
+  const MyApp({super.key, required this.brandColorp});
+
+  // 这个组件是你的应用程序的根。
   @override
   Widget build(BuildContext context) {
-    return DynamicColorBuilder(
-      builder: (ColorScheme? lightDynamic, ColorScheme? darkDynamic) {
-        ThemeData themeData =
-            MediaQuery.of(context).platformBrightness == Brightness.dark
-                ? ThemeData(
-                    // 使用 darkDynamic 作为主题的颜色方案
-                    colorScheme: darkDynamic ?? ThemeData.dark().colorScheme,
-                    useMaterial3: true,
-                  )
-                : ThemeData(
-                    // 使用 lightDynamic 作为主题的颜色方案
-                    colorScheme: lightDynamic ?? ThemeData.light().colorScheme,
-                    useMaterial3: true,
-                  );
+    // 定义应用的主题颜色方案
+    final ColorScheme defaultLightColorScheme =
+        ColorScheme.fromSeed(seedColor: brandColorp);
 
+    final ColorScheme defaultDarkColorScheme = ColorScheme.fromSeed(
+        seedColor: brandColorp, brightness: Brightness.dark);
+
+    // 使用 DynamicColorBuilder 来动态获取颜色方案
+    return DynamicColorBuilder(
+      builder: (ColorScheme? lightColorScheme, ColorScheme? darkColorScheme) {
         return MaterialApp(
           title: 'Random Item',
-          theme: themeData,
+          theme: ThemeData(
+            colorScheme: lightColorScheme ?? defaultLightColorScheme,
+            useMaterial3: true,
+          ),
+          darkTheme: ThemeData(
+            colorScheme: darkColorScheme ?? defaultDarkColorScheme,
+            useMaterial3: true,
+          ),
+          themeMode: ThemeMode.system,
           home: const HomePage(title: 'Random Item 主页'),
         );
       },
@@ -59,48 +71,91 @@ class MyApp extends StatelessWidget {
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.title});
 
-// 这个组件是你的应用程序的首页。它是有状态的，意味着它有一个 State 对象（下面定义），其中包含影响其外观的字段。
-
-// 这个类是状态的配置。它保存由父组件（在这个例子中是 App 组件）提供的值（在这个例子中是标题），并由 State 的 build 方法使用。Widget 子类中的字段总是标记为 "final"。
-
   final String title;
 
   @override
-  State<HomePage> createState() => HomePageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class HomePageState extends State<HomePage> {
-  // 用于存储当前显示的随机元素
-  dynamic _currentItem;
+class _HomePageState extends State<HomePage> {
+  String? _currentItem;
+  late String _currentItemKey;
+  String? _lastCurrentItemKey;
+  bool isInstantRefreshMode = false; // 用于切换抽取随机项目的模式
 
   @override
   void initState() {
-    // 程序启动时加载JSON数据
-    loadDataAndConfig();
+    loadDataAndConfig().then((value) {
+      if (toRandomItemKeySet.isNotEmpty) {
+        _currentItemKey = toRandomItemKeySet.first;
+      }
+    });
     super.initState();
   }
 
-  void _refreshDataFile() async {
-    await copyJsonFile(await filePickTry());
-    loadDataAndConfig();
+  // 所谓的 Skip 只会使匹配的项目在最后被选出，并不是无法选中
+  Future<void> _refreshItem() async {
+    final now = DateTime.now();
+
+    if (toRandomItemKeySet.isEmpty) return;
+
+    if (toRandomItemKeySet.length == 1) {
+      _updateCurrentItem(toRandomItemKeySet.first);
+      return;
+    }
+
+    String? newKey;
+    int attemptCount = 0;
+    const maxAttempts = 10;
+
+    while (attemptCount < maxAttempts) {
+      newKey = randomSetItem(toRandomItemKeySet);
+
+      if (newKey == _currentItemKey ||
+          newKey == _lastCurrentItemKey ||
+          historyItemSet.contains(newKey)) {
+        attemptCount++;
+        continue;
+      }
+
+      final shouldSkip = filters.any((filter) {
+        final scheduleList = (filter["schedule"] as List)
+            .whereType<Map<String, dynamic>>()
+            .toList();
+        final filterConditions = (filter["filter"]["conditions"] as List)
+            .whereType<Map<String, dynamic>>();
+
+        return checkAllConditions(now, scheduleList) &&
+            filterConditions.any((condition) =>
+                getTargetDataInFormatMapItem(itemListData![newKey!],
+                    key: condition["key"]) ==
+                condition["value"]);
+      });
+
+      if (!shouldSkip) break;
+
+      attemptCount++;
+    }
+
+    if (newKey != null) {
+      _updateCurrentItem(newKey);
+    }
+  }
+
+  void _updateCurrentItem(String key) {
+    _lastCurrentItemKey = _currentItemKey;
+    _currentItemKey = key;
+    _currentItem = getTargetDataInFormatMapItem(itemListData![key]!);
     setState(() {});
   }
 
-  Future<void> _refreshItem() async {
-    // 随机抽取元素
-    _currentItem = getTargetDataInFormatMapItem(randomMapItem(itemListData));
-    setState(() {
-      // 这个调用 setState 告诉 Flutter 框架这个 State 中的某些东西已经改变了，这会导致重新运行下面的 build 方法，以便显示屏可以反映更新后的值。
-      // 如果我们改变值而没有调用 setState()，那么 build 方法将不会被再次调用，因此看起来什么也没有发生。
-    });
-  } // 添加一个方法来处理导航到设置页面的动作
-
-  // Timer 相关函数
   Timer? _timer;
 
   void changeTimerState() {
     if (isTimerRunning) {
       _pauseTimer();
+      historyItemSet.add(_currentItemKey);
+      toRandomItemKeySet.remove(_currentItemKey);
       isTimerRunning = false;
     } else {
       _startTimer();
@@ -110,106 +165,449 @@ class HomePageState extends State<HomePage> {
   }
 
   void _startTimer() {
-    _timer = Timer.periodic(Duration(milliseconds: randomInterval ?? 10),
-        (timer) async {
-      await _refreshItem();
+    _timer =
+        Timer.periodic(Duration(milliseconds: randomInterval ?? 10), (timer) {
+      _refreshItem();
     });
   }
 
   void _pauseTimer() {
     _timer?.cancel();
+    _timer = null;
   }
+
+  bool isVisible = false;
 
   @override
   Widget build(BuildContext context) {
-    // 每次调用 setState 时，这个方法都会重新运行，例如上面 _refreshItem 方法所做的那样。
+    // var sizingInformation =
+    //     SizingInformation(MediaQuery.of(context).size.width);
 
-    // Flutter 框架已经优化，使得重新运行 build 方法非常快速，这样你就可以重建任何需要更新的内容，而不必单独更改 widget 的实例。
+    // var floatingActionButtonList = [
+    //   FloatingActionButton(
+    //     heroTag: "refreshDataFile_FloatingActionButton",
+    //     onPressed: () {
+    //       refreshDataFile().then((value) {
+    //         setState(() {});
+    //       });
+    //     },
+    //     tooltip: 'Refresh Data File',
+    //     child: const Icon(Icons.file_open_rounded),
+    //   ),
+    //   const SizedBox(height: 8, width: 8),
+    //   FloatingActionButton(
+    //     heroTag: "cleanHistory_FloatingActionButton",
+    //     onPressed: () {
+    //       toRandomItemKeySet.addAll(historyItemSet);
+    //       historyItemSet.clear();
+    //       setState(() {});
+    //     },
+    //     tooltip: 'Clean History',
+    //     child: const Icon(Icons.delete_rounded),
+    //   ),
+    //   const SizedBox(height: 8, width: 8),
+    //   FloatingActionButton(
+    //     heroTag: "btn5",
+    //     onPressed: () {
+    //       if (isTimerRunning) {
+    //         changeTimerState();
+    //       }
+    //       Navigator.push(
+    //         context,
+    //         MaterialPageRoute(
+    //           builder: (context) => const HistoryPage(),
+    //         ),
+    //       ).then((value) {
+    //         setState(() {});
+    //       });
+    //     },
+    //     tooltip: 'View History',
+    //     child: const Icon(Icons.history_rounded),
+    //   ),
+    // ];
+    var floatingActionButtonList = [
+      IgnorePointer(
+        ignoring: !isVisible,
+        child: AnimatedOpacity(
+          opacity: isVisible ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 200),
+          child: Row(
+            children: [
+              FloatingActionButton(
+                heroTag: "refreshDataFile_FloatingActionButton",
+                onPressed: () {
+                  refreshDataFile().then((value) {
+                    setState(() {});
+                  });
+                },
+                tooltip: 'Refresh Data File',
+                child: const Icon(Icons.file_open_rounded),
+              ),
+              const SizedBox(height: 8, width: 8),
+              FloatingActionButton(
+                heroTag: "cleanHistory_FloatingActionButton",
+                onPressed: () {
+                  toRandomItemKeySet.addAll(historyItemSet);
+                  historyItemSet.clear();
+                  setState(() {});
+                },
+                tooltip: 'Clean History',
+                child: const Icon(Icons.delete_rounded),
+              ),
+              const SizedBox(height: 8, width: 8),
+              FloatingActionButton(
+                heroTag: "btn5",
+                onPressed: () {
+                  if (isTimerRunning) {
+                    changeTimerState();
+                  }
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const HistoryPage(),
+                    ),
+                  ).then((value) {
+                    setState(() {});
+                  });
+                },
+                tooltip: 'View History',
+                child: const Icon(Icons.history_rounded),
+              ),
+            ],
+          ),
+        ),
+      ),
+      const SizedBox(
+        width: 8,
+        height: 8,
+      ),
+      FloatingActionButton(
+        onPressed: () {
+          setState(() {
+            isVisible = !isVisible;
+          });
+        },
+        child: Icon(isVisible ? Icons.visibility : Icons.visibility_off),
+      ),
+    ];
+    var contextTheme = Theme.of(context);
+    const String noItemsMessage = "There is no item for random selection.";
+    const String onlyOneItemMessage =
+        "Are you sure you want a random selection with only one item?";
     return Scaffold(
       appBar: AppBar(
-        // 在这里，我们从由 App.build 方法创建的 MyHomePage 对象中获取值，
-        // 并使用它来设置我们的 appbar 标题。
         title: Text(
           titleData ?? widget.title,
           style: TextStyle(
-            color: Theme.of(context).colorScheme.primary, // 使用主题中的主要颜色
+            color: contextTheme.colorScheme.primary,
           ),
         ),
       ),
       body: Center(
         child: Column(
-          // Column 也是一个布局组件。它接收一组子组件列表，
-          // 并将它们垂直排列。默认情况下，它会根据其子组件的水平尺寸来调整自己的尺寸，
-          // 并尝试与父组件的高度一致。
-          //
-          // Column 有各种属性来控制它如何调整自己的尺寸以及如何定位其子组件。
-          // 在这里，我们使用mainAxisAlignment来垂直居中子组件；这里的主轴是垂直轴，
-          // 因为Column是垂直的（交叉轴将是水平的）。
-          //
-          // 试试这个：调用“调试绘制”（在IDE中选择“切换调试绘制”动作，
-          // 或在控制台中按“p”），以查看每个组件的线框图。
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
+            const Spacer(),
+            isItemListDataEmpty
+                ? const Text(noItemsMessage)
+                : _currentItem == null
+                    ? Column(
+                        children: [
+                          Text(
+                            "Click to start!",
+                            style: contextTheme.textTheme.headlineMedium,
+                          ),
+                          const Icon(Icons.arrow_downward_rounded),
+                        ],
+                      )
+                    : Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            tipsData ?? "This time is",
+                            style: contextTheme.textTheme.headlineMedium,
+                          ),
+                          SizedBox(
+                            height: (itemFontSize ?? 60) * 1.5,
+                            child: Text(
+                              '$_currentItem',
+                              style: TextStyle(
+                                color: contextTheme.colorScheme.onSurface,
+                                fontSize: itemFontSize ?? 60,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+            const SizedBox(
+              height: 8,
+            ),
+            itemListData?.keys.toSet().length == 1
+                ? IconButton.filledTonal(
+                    onPressed: () {
+                      // 清除当前的SnackBar
+                      ScaffoldMessenger.of(context).removeCurrentSnackBar();
+                      // 显示新的SnackBar
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: const Text(onlyOneItemMessage),
+                          action: SnackBarAction(
+                              label: "Sorry",
+                              onPressed: () => ScaffoldMessenger.of(context)
+                                  .removeCurrentSnackBar),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.bug_report_rounded))
+                : isInstantRefreshMode
+                    ? IconButton.filledTonal(
+                        onPressed: toRandomItemKeySet.isEmpty
+                            ? null
+                            : () {
+                                _refreshItem().then((value) {
+                                  historyItemSet.add(_currentItemKey);
+                                  toRandomItemKeySet.remove(_currentItemKey);
+                                });
+                              },
+                        tooltip: 'Refresh Item',
+                        icon: const Icon(Icons.refresh_rounded),
+                      )
+                    : IconButton.filledTonal(
+                        onPressed: toRandomItemKeySet.isEmpty
+                            ? null
+                            : changeTimerState,
+                        tooltip:
+                            isTimerRunning ? 'Start Scroll' : 'Stop Scroll',
+                        icon: Icon(isTimerRunning
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded),
+                      ),
+            const Spacer(),
             Text(
-              tipsData ?? "This time is",
-              style: Theme.of(context).textTheme.headlineMedium,
+              'Current mode is ${isInstantRefreshMode ? "Instant" : "Scroll"}',
+              style: contextTheme.textTheme.headlineMedium,
             ),
-            SizedBox(
-              height: (itemFontSize ?? 60) * 1.5,
-              child: Text(
-                '$_currentItem',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurface, // 使用主题中的主要颜色
-                  fontSize: itemFontSize ?? 60, // 设置文字大小为60像素
-                ),
-              ),
+            const SizedBox(
+              height: 8,
             ),
-            SizedBox(
-              width: 60.0, // 设置容器的宽度
-              height: 60.0, // 设置容器的高度
-              // 添加圆形裁剪
-              child: ClipOval(
-                child: Material(
-                  color:
-                      Theme.of(context).colorScheme.primaryContainer, // 设置背景颜色
-                  child: IconButton(
-                    onPressed: changeTimerState,
-                    tooltip: isTimerRunning ? 'Start' : 'Stop',
-                    icon: Icon(isTimerRunning
-                        ? Icons.pause_rounded
-                        : Icons.play_arrow_rounded),
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onPrimaryContainer, // 图标颜色
-                    iconSize: 24, // 图标大小
-                  ),
-                ),
-              ),
+            Switch(
+              value: isInstantRefreshMode,
+              onChanged: (bool value) {
+                if (isTimerRunning) {
+                  changeTimerState();
+                }
+                isInstantRefreshMode = !isInstantRefreshMode;
+                setState(() {});
+              },
+            ),
+            const SizedBox(
+              height: 8,
             ),
           ],
         ),
       ),
+      // floatingActionButton: sizingInformation.isMobile
+      //     ? Column(
+      //         mainAxisAlignment: MainAxisAlignment.end,
+      //         mainAxisSize: MainAxisSize.min,
+      //         children: floatingActionButtonList,
+      //       )
+      //     : Row(
+      //         mainAxisAlignment: MainAxisAlignment.end,
+      //         mainAxisSize: MainAxisSize.min,
+      //         children: floatingActionButtonList,
+      //       ),
       floatingActionButton: Row(
-        mainAxisAlignment: MainAxisAlignment.end, // 将按钮放置在屏幕的末端
-        children: <Widget>[
-          FloatingActionButton(
-            heroTag: 'refreshDataFileFloatingActionButton',
-            onPressed: _refreshDataFile,
-            tooltip: 'Refresh Data File',
-            child: const Icon(Icons.file_open_rounded),
-          ),
-          const SizedBox(width: 16.0), // 空间间隔
-          FloatingActionButton(
-            heroTag: 'refreshItemFloatingActionButton',
-            onPressed: _refreshItem,
-            tooltip: 'Refresh Item',
-            child: const Icon(Icons.refresh_rounded),
-          ),
-        ],
-      ), // 这个尾随逗号使得自动格式化对于构建方法更加友好。
+        mainAxisAlignment: MainAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: floatingActionButtonList,
+      ),
     );
   }
 }
+
+class HistoryPage extends StatefulWidget {
+  const HistoryPage({super.key});
+
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  bool isVisible = false;
+
+  @override
+  Widget build(BuildContext context) {
+    // var floatingActionButtonList = [
+    //   FloatingActionButton(
+    //     heroTag: "refreshDataFile_FloatingActionButton",
+    //     onPressed: () {
+    //       refreshDataFile().then((value) {
+    //         setState(() {});
+    //       });
+    //     },
+    //     tooltip: 'Refresh Data File',
+    //     child: const Icon(Icons.file_open_rounded),
+    //   ),
+    //   const SizedBox(height: 8, width: 8),
+    //   FloatingActionButton(
+    //     heroTag: "cleanHistory_FloatingActionButton",
+    //     onPressed: () {
+    //       toRandomItemKeySet.addAll(historyItemSet);
+    //       historyItemSet.clear();
+    //       setState(() {});
+    //     },
+    //     tooltip: 'Clean History',
+    //     child: const Icon(Icons.delete_rounded),
+    //   ),
+    // ];
+    var floatingActionButtonList = [
+      IgnorePointer(
+        ignoring: !isVisible,
+        child: AnimatedOpacity(
+          opacity: isVisible ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 200),
+          child: Row(
+            children: [
+              FloatingActionButton(
+                heroTag: "refreshDataFile_FloatingActionButton",
+                onPressed: () {
+                  refreshDataFile().then((value) {
+                    setState(() {});
+                  });
+                },
+                tooltip: 'Refresh Data File',
+                child: const Icon(Icons.file_open_rounded),
+              ),
+              const SizedBox(height: 8, width: 8),
+              FloatingActionButton(
+                heroTag: "cleanHistory_FloatingActionButton",
+                onPressed: () {
+                  toRandomItemKeySet.addAll(historyItemSet);
+                  historyItemSet.clear();
+                  setState(() {});
+                },
+                tooltip: 'Clean History',
+                child: const Icon(Icons.delete_rounded),
+              ),
+            ],
+          ),
+        ),
+      ),
+      const SizedBox(
+        width: 8,
+        height: 8,
+      ),
+      FloatingActionButton(
+        onPressed: () {
+          setState(() {
+            isVisible = !isVisible;
+          });
+        },
+        child: Icon(isVisible ? Icons.visibility : Icons.visibility_off),
+      ),
+    ];
+
+    var contextTheme = Theme.of(context);
+
+    // var sizingInformation =
+    //     SizingInformation(MediaQuery.of(context).size.width);
+    return Scaffold(
+      appBar: AppBar(
+        // leading: const BackButton(),
+        // automaticallyImplyLeading: false,
+        title: Text(
+          'History',
+          style: TextStyle(
+            color: contextTheme.colorScheme.primary,
+          ),
+        ),
+        actions: [
+          IconButton(
+            onPressed: () {
+              // 清除当前的SnackBar
+              ScaffoldMessenger.of(context).removeCurrentSnackBar();
+              // 显示新的SnackBar
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text("Feature not implemented"),
+                  action: SnackBarAction(
+                      label: "OK",
+                      onPressed: () =>
+                          ScaffoldMessenger.of(context).removeCurrentSnackBar),
+                ),
+              );
+            },
+            icon: const Icon(Icons.output_rounded),
+          ),
+          const SizedBox(
+            width: 8,
+          ),
+        ],
+      ),
+      body: historyItemSet.isEmpty
+          ? const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.error_outline_rounded),
+                  Text(
+                    "No data here!",
+                    style: TextStyle(fontSize: 24),
+                  )
+                ],
+              ),
+            )
+          : ListView(
+              children: historyItemSet
+                  .map((item) => ListTile(
+                        title: Text(
+                          getTargetDataInFormatMapItem(itemListData![item]) ??
+                              "",
+                          // style: const TextStyle(fontSize: 24),
+                        ),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.close_rounded),
+                          onPressed: () {
+                            toRandomItemKeySet.add(item);
+                            historyItemSet.remove(item);
+                            setState(() {});
+                          },
+                        ),
+                      ))
+                  .toList(),
+            ),
+      floatingActionButton: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: floatingActionButtonList,
+      ),
+      // floatingActionButton: sizingInformation.isMobile
+      //     ? Column(
+      //         mainAxisSize: MainAxisSize.min,
+      //         crossAxisAlignment: CrossAxisAlignment.end,
+      //         children: floatingActionButtonList,
+      //       )
+      //     : Row(
+      //         mainAxisSize: MainAxisSize.min,
+      //         crossAxisAlignment: CrossAxisAlignment.end,
+      //         children: floatingActionButtonList,
+      //       ),
+    );
+  }
+}
+
+class SizingInformation {
+  final bool isMobile;
+  final bool isTabletOrDesktop;
+  final bool isDesktop;
+
+  const SizingInformation(double width)
+      : isMobile = width < 700,
+        isTabletOrDesktop = width >= 700,
+        isDesktop = width >= 800;
+}
+// 以下为测试的函数++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 // 以下为自定义的函数++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -222,17 +620,17 @@ Future<Map?> loadJsonAsMap(String filePath) async {
   }
 }
 
-Map? randomMapItem(Map? itemListMap) {
-  return (itemListMap == null || itemListMap.isEmpty)
+String? randomSetItem(Set<String> itemSet) {
+  return itemSet.isEmpty
       ? null
-      : itemListMap[
-          itemListMap.keys.toList()[Random().nextInt(itemListMap.length)]];
+      : itemSet.toList()[Random().nextInt(itemSet.length)];
 }
 
-String? getTargetDataInFormatMapItem(Map? formatMapItem) {
+dynamic getTargetDataInFormatMapItem(Map<String, dynamic>? formatMapItem,
+    {String key = "name"}) {
   return (formatMapItem == null || formatMapItem.isEmpty)
       ? null
-      : formatMapItem['name'];
+      : formatMapItem[key];
 }
 
 Future<String> initAppDocDir() async {
@@ -263,11 +661,12 @@ Future<void> initDirectory(String directoryPath) async {
   }
 }
 
-Future<List<PlatformFile>?> filePickTry() async {
+Future<List<PlatformFile>?> filePickTry(
+    List<String> allowedExtensionsList) async {
   try {
     List<PlatformFile>? result = (await FilePicker.platform.pickFiles(
       type: FileType.custom, // 使用自定义文件类型
-      allowedExtensions: ['json'], // 指定允许的文件扩展名列表
+      allowedExtensions: allowedExtensionsList, // 指定允许的文件扩展名列表
       allowMultiple: true,
     ))
         ?.files;
@@ -288,8 +687,8 @@ Future<List<PlatformFile>?> filePickTry() async {
 Future<void> copyJsonFile(List<PlatformFile>? sourcePathList) async {
   if (sourcePathList != null) {
     String appDocDir = await initAppDocDir(); // 解析JSON字符串到Dart对象
-    for (PlatformFile i in sourcePathList) {
-      String sourcePath = i.path ?? "";
+    for (PlatformFile sourceFile in sourcePathList) {
+      String sourcePath = sourceFile.path ?? "";
       final Map? jsonData = await loadJsonAsMap(sourcePath);
       String fileName;
       fileName =
@@ -322,12 +721,17 @@ Future<void> loadDataAndConfig() async {
       titleData = jsonData['title'];
       descriptionData = jsonData['description'];
       tipsData = jsonData['tips'];
+      isItemListDataEmpty = (jsonData['data'] as Map).isEmpty;
+      toRandomItemKeySet.clear();
+      toRandomItemKeySet.addAll(itemListData!.keys.toSet());
     } else {
       // 如果 jsonData 为 null，重置相关数据
       itemListData = null;
       titleData = null;
       descriptionData = null;
       tipsData = null;
+      isItemListDataEmpty = false;
+      toRandomItemKeySet.clear();
     }
 
     // 加载并解析 config.json
@@ -338,6 +742,8 @@ Future<void> loadDataAndConfig() async {
       themeState = configData['themeState'];
       itemFontSize = configData['itemFontSize'].toDouble();
       randomInterval = configData['randomInterval'].toInt();
+      filters.clear();
+      filters.addAll(configData['filters']);
     } else {
       // 如果 jsonConfig 为 null，重置相关配置
       themeState = null;
@@ -346,8 +752,13 @@ Future<void> loadDataAndConfig() async {
     }
   } catch (error) {
     // 如果发生异常，打印堆栈信息
-    print(error.toString());
+    debugPrint(error.toString());
     // 可以选择不重置任何数据，因为已经通过 jsonData 和 jsonConfig 检查了 null 情况
     // 或者，如果需要，可以在这里添加额外的错误处理逻辑
   }
+}
+
+Future<void> refreshDataFile() async {
+  await copyJsonFile(await filePickTry(["json"]));
+  loadDataAndConfig();
 }
